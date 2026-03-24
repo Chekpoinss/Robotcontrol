@@ -19,6 +19,10 @@
 - OpenCV
 - NumPy
 
+
+##Запуск
+py -m src.main Resources/checkline/for_pub/eval1/robot_2026-03-13_10-27-09 outputs/eval1_user.txt outputs/eval1_debug.mp4
+
 ## Структура проекта
 
 ```text
