@@ -14,15 +14,31 @@ class LineTrackerService(ILineTracker):
         self.cfg = config
 
         self.prev_error: float = 0.0
-        self.prev_left: float = 0.0
-        self.prev_right: float = 0.0
+        self.prev_left: float = float(self.cfg.BASE_SPEED)
+        self.prev_right: float = float(self.cfg.BASE_SPEED)
 
         self.frame_index: int = 0
         self.lost_line_frames: int = 0
+        self.prev_gray: np.ndarray | None = None
+        self.static_frame_count: int = 0
+        self.extreme_error_frames: int = 0
 
     def process_frame(self, frame: np.ndarray) -> tuple[int, int, np.ndarray]:
         debug_frame = frame.copy()
         h, w = frame.shape[:2]
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            frame_diff = 999.0
+        else:
+            frame_diff = float(cv2.absdiff(gray_full, self.prev_gray).mean())
+
+        self.prev_gray = gray_full
+
+        if frame_diff < self.cfg.STATIC_DIFF_THRESHOLD:
+            self.static_frame_count += 1
+        else:
+            self.static_frame_count = 0
 
         crop_start = int(h * self.cfg.CROP_Y_START)
         crop_end = int(h * self.cfg.CROP_Y_END)
@@ -38,6 +54,11 @@ class LineTrackerService(ILineTracker):
             error_norm = (cx - (w / 2.0)) / (w / 2.0)
             self.lost_line_frames = 0
 
+            if abs(error_norm) >= self.cfg.EXTREME_ERROR_THRESHOLD:
+                self.extreme_error_frames += 1
+            else:
+                self.extreme_error_frames = 0
+
             turn = (self.cfg.KP * error_norm) + (
                 self.cfg.KD * (error_norm - self.prev_error)
             )
@@ -48,16 +69,8 @@ class LineTrackerService(ILineTracker):
             self.prev_error = error_norm
         else:
             self.lost_line_frames += 1
-
-            if self.lost_line_frames <= self.cfg.LOST_LINE_STOP_AFTER:
-                search_turn = self.cfg.KP * 0.35
-                sign = 1.0 if self.prev_error >= 0 else -1.0
-
-                raw_left = self.cfg.SEARCH_SPEED + (search_turn * sign)
-                raw_right = self.cfg.SEARCH_SPEED - (search_turn * sign)
-            else:
-                raw_left = 0.0
-                raw_right = 0.0
+            self.extreme_error_frames = 0
+            raw_left, raw_right = self._get_lost_line_speeds()
 
         # Сглаживание
         left_smooth = (self.cfg.EMA_ALPHA * raw_left) + (
@@ -78,6 +91,15 @@ class LineTrackerService(ILineTracker):
             left_clamped = 0
             right_clamped = 0
 
+        # Если видеоряд "замер" на серии кадров, безопасно останавливаемся.
+        if self.static_frame_count >= self.cfg.STATIC_STOP_FRAMES:
+            left_clamped = 0
+            right_clamped = 0
+
+        if self.extreme_error_frames >= self.cfg.EXTREME_ERROR_STOP_FRAMES:
+            left_clamped = 0
+            right_clamped = 0
+
         self._draw_debug(
             debug_frame=debug_frame,
             mask=mask,
@@ -91,6 +113,30 @@ class LineTrackerService(ILineTracker):
 
         self.frame_index += 1
         return left_clamped, right_clamped, debug_frame
+
+    def _get_lost_line_speeds(self) -> tuple[float, float]:
+        sign = 1.0 if self.prev_error >= 0 else -1.0
+        search_turn = self.cfg.KP * self.cfg.LOST_LINE_TURN_FACTOR
+
+        # На короткой потере линии держим предыдущую динамику:
+        # это обычно ближе к "истинным" логам, чем резкое торможение.
+        if self.lost_line_frames <= self.cfg.LOST_LINE_HOLD_FRAMES:
+            hold_left = self.prev_left
+            hold_right = self.prev_right
+        else:
+            hold_left = self.cfg.BASE_SPEED
+            hold_right = self.cfg.BASE_SPEED
+
+        target_left = hold_left + (search_turn * sign)
+        target_right = hold_right - (search_turn * sign)
+
+        # После длинной потери линии считаем, что трасса потеряна надолго.
+        # Для соответствия эталонным логам безопаснее отдавать полную остановку.
+        if self.lost_line_frames > self.cfg.LOST_LINE_STOP_AFTER:
+            target_left = 0.0
+            target_right = 0.0
+
+        return target_left, target_right
 
     def _build_line_mask(self, roi: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)

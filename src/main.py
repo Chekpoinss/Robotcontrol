@@ -52,6 +52,52 @@ def pad_results(results: List[Tuple[int, int]], target_frames: int) -> List[Tupl
     return results
 
 
+def postprocess_results(
+    results: List[Tuple[int, int]],
+    base_speed: int,
+    ema_alpha: float,
+    scale_around_base: float,
+) -> List[Tuple[int, int]]:
+    if not results:
+        return results
+
+    smoothed: List[Tuple[float, float]] = []
+    prev_left = 0.0
+    prev_right = 0.0
+    has_non_zero_history = False
+
+    for left, right in results:
+        # Важный инвариант: явные остановки (0, 0) должны оставаться остановками.
+        if left == 0 and right == 0:
+            smoothed.append((0.0, 0.0))
+            prev_left = 0.0
+            prev_right = 0.0
+            continue
+
+        if not has_non_zero_history:
+            prev_left = float(left)
+            prev_right = float(right)
+            has_non_zero_history = True
+
+        left_ema = (ema_alpha * float(left)) + ((1.0 - ema_alpha) * prev_left)
+        right_ema = (ema_alpha * float(right)) + ((1.0 - ema_alpha) * prev_right)
+        smoothed.append((left_ema, right_ema))
+        prev_left = left_ema
+        prev_right = right_ema
+
+    processed: List[Tuple[int, int]] = []
+    for (raw_left, raw_right), (left, right) in zip(results, smoothed):
+        if raw_left == 0 and raw_right == 0:
+            processed.append((0, 0))
+            continue
+
+        left_scaled = base_speed + ((left - base_speed) * scale_around_base)
+        right_scaled = base_speed + ((right - base_speed) * scale_around_base)
+        processed.append((int(round(left_scaled)), int(round(right_scaled))))
+
+    return processed
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         print(
@@ -122,6 +168,12 @@ def main() -> None:
         if debug_writer is not None:
             debug_writer.release()
 
+    results = postprocess_results(
+        results=results,
+        base_speed=config.BASE_SPEED,
+        ema_alpha=config.OUTPUT_EMA_ALPHA,
+        scale_around_base=config.OUTPUT_SCALE_AROUND_BASE,
+    )
     results = pad_results(results, config.TARGET_FRAMES)
     write_results(output_txt_path, results)
 
